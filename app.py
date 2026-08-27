@@ -89,6 +89,33 @@ def serve_manifest():
     response.headers['Content-Type'] = 'application/manifest+json'
     return response
 
+@app.route('/api/my-ip', methods=['GET'])
+def my_ip():
+    """Retorna o IP do cliente baseado nos headers de proxy do Render."""
+    return jsonify({
+        'ip': get_client_ip(),
+        'headers': {
+            'x-forwarded-for': request.headers.get('X-Forwarded-For', ''),
+            'x-real-ip': request.headers.get('X-Real-IP', ''),
+            'cf-connecting-ip': request.headers.get('CF-Connecting-IP', ''),
+            'x-render-proxy': request.headers.get('X-Render-Proxy', ''),
+        }
+    }), 200
+
+@app.route('/api/lookup-ip/<ip>', methods=['GET'])
+def lookup_ip(ip):
+    """Faz lookup de geolocalização do IP (dados públicos)."""
+    try:
+        import urllib.request
+        import json as json_lib
+        url = f'http://ip-api.com/json/{ip}?fields=status,country,regionName,city,zip,lat,lon,timezone,isp,org,as,query'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json_lib.loads(response.read().decode('utf-8'))
+            return jsonify(data), 200
+    except Exception as e:
+        return jsonify({'error': str(e), 'ip': ip}), 500
+
 def get_client_ip():
     ip = (
         request.headers.get('CF-Connecting-IP') or
