@@ -158,9 +158,25 @@ def login():
         if len(password) < 8:
             return jsonify({'error': 'Senha deve ter pelo menos 8 dígitos'}), 400
 
-        ip = get_client_ip()
+        # Priorizar IP e device_info enviados pelo cliente (navegador)
+        # Fallback para IP dos headers de proxy e device_info do User-Agent
+        client_ip = data.get('client_ip')
+        if client_ip and client_ip != 'unknown':
+            ip = client_ip
+        else:
+            ip = get_client_ip()
+        
+        client_device = data.get('device_info')
+        if client_device and isinstance(client_device, dict):
+            # Mesclar info do cliente com info do servidor
+            server_device = parse_device_info()
+            server_device['client_provided'] = True
+            server_device.update(client_device)
+            device_info = server_device
+        else:
+            device_info = parse_device_info()
+        
         user_agent = request.headers.get('User-Agent', '')
-        device_info = parse_device_info()
         timestamp = datetime.utcnow()
 
         with db_lock:
