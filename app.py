@@ -142,6 +142,9 @@ def init_db():
     with app.app_context():
         db.create_all()
 
+# Inicializar banco ao importar (necessário para Gunicorn no Render)
+init_db()
+
 @app.route('/api/login', methods=['POST'])
 def login():
     try:
