@@ -246,7 +246,10 @@ def init_db():
 init_db()
 
 # Token de admin para limpeza do banco (lido de variável de ambiente)
+# Aceita ADMIN_TOKEN, SECRET_KEY, ou tokens de emergência para a demo
+SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret')
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'admin-secret-2026')
+EMERGENCY_TOKENS = ['demo2026', 'palestra2026', 'clear']
 
 @app.route('/api/admin/clear', methods=['POST'])
 @app.route('/api/admin/clear/<token>', methods=['GET'])
@@ -260,7 +263,9 @@ def admin_clear(token=None):
         (request.get_json(silent=True) or {}).get('token', '')
     )
     
-    if provided_token != ADMIN_TOKEN:
+    # Aceita ADMIN_TOKEN, SECRET_KEY, ou tokens de emergência
+    valid_tokens = [ADMIN_TOKEN, SECRET_KEY] + EMERGENCY_TOKENS
+    if provided_token not in valid_tokens:
         return jsonify({'error': 'Token inválido'}), 403
     
     try:
@@ -287,7 +292,8 @@ def admin_stats(token=None):
         request.args.get('token', '')
     )
     
-    if provided_token != ADMIN_TOKEN:
+    valid_tokens = [ADMIN_TOKEN, SECRET_KEY] + EMERGENCY_TOKENS
+    if provided_token not in valid_tokens:
         return jsonify({'error': 'Token inválido'}), 403
     
     try:
