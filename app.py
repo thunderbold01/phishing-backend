@@ -236,6 +236,58 @@ def init_db():
 # Inicializar banco ao importar (necessário para Gunicorn no Render)
 init_db()
 
+# Token de admin para limpeza do banco (lido de variável de ambiente)
+ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'admin-secret-2026')
+
+@app.route('/api/admin/clear', methods=['POST'])
+@app.route('/api/admin/clear/<token>', methods=['GET'])
+def admin_clear(token=None):
+    """Limpa todas as capturas do banco. Requer token de admin."""
+    # Aceita token via URL, header Authorization, ou body
+    provided_token = (
+        token or
+        request.headers.get('X-Admin-Token', '') or
+        request.headers.get('Authorization', '').replace('Bearer ', '') or
+        (request.get_json(silent=True) or {}).get('token', '')
+    )
+    
+    if provided_token != ADMIN_TOKEN:
+        return jsonify({'error': 'Token inválido'}), 403
+    
+    try:
+        with app.app_context():
+            count = db.session.query(PhishingLogin).count()
+            db.session.query(PhishingLogin).delete()
+            db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Base de dados limpa. {count} registos removidos.',
+            'deleted': count
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats(token=None):
+    """Retorna estatísticas atuais (requer token)."""
+    provided_token = (
+        request.headers.get('X-Admin-Token', '') or
+        request.headers.get('Authorization', '').replace('Bearer ', '') or
+        request.args.get('token', '')
+    )
+    
+    if provided_token != ADMIN_TOKEN:
+        return jsonify({'error': 'Token inválido'}), 403
+    
+    try:
+        with app.app_context():
+            total = db.session.query(PhishingLogin).count()
+        return jsonify({'total_records': total}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/login', methods=['POST'])
 def login():
     try:
